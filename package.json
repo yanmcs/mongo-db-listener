@@ -1,0 +1,14 @@
+{
+  "name": "mongo-db-listener",
+  "version": "1.0.0",
+  "description": "Listens to MongoDB changes and sends them to RabbitMQ",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.3",
+    "mongodb": "^6.3.0"
+  }
+}
+
