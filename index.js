@@ -138,6 +138,46 @@ async function proactiveHealthCheck() {
   }
 }
 
+// 📸 Enable pre/post images on collections for before/after document capture
+async function ensurePrePostImagesEnabled(db, collectionName) {
+  try {
+    // Get collection info to check current settings
+    const collInfos = await db.listCollections({ name: collectionName }).toArray();
+    
+    if (collInfos.length === 0) {
+      console.warn(`⚠️ Collection [${collectionName}] does not exist yet. Pre/post images will be enabled when created.`);
+      return false;
+    }
+    
+    const collInfo = collInfos[0];
+    const prePostEnabled = collInfo.options?.changeStreamPreAndPostImages?.enabled === true;
+    
+    if (prePostEnabled) {
+      console.log(`✅ Pre/post images already enabled for [${collectionName}]`);
+      return true;
+    }
+    
+    // Enable pre/post images
+    console.log(`🔧 Enabling pre/post images for [${collectionName}]...`);
+    await db.command({
+      collMod: collectionName,
+      changeStreamPreAndPostImages: { enabled: true }
+    });
+    console.log(`✅ Pre/post images enabled for [${collectionName}]`);
+    return true;
+  } catch (err) {
+    // Handle common errors gracefully
+    if (err.code === 72 || err.message.includes('Invalid collection option')) {
+      console.warn(`⚠️ MongoDB version may not support pre/post images (requires 6.0+): ${err.message}`);
+    } else if (err.code === 26 || err.message.includes('ns not found')) {
+      console.warn(`⚠️ Collection [${collectionName}] not found. Will be created on first insert.`);
+    } else {
+      console.warn(`⚠️ Could not enable pre/post images for [${collectionName}]: ${err.message}`);
+    }
+    return false;
+  }
+}
+
 async function connectRabbitMQ() {
   while (!isStopping) {
     try {
@@ -527,14 +567,18 @@ async function start() {
       const db = mongoClient.db(dbName);
       const syncCollection = db.collection(syncCollectionName);
 
+      // 📸 Auto-enable pre/post images on all watched collections
+      console.log('📸 Checking pre/post image settings for collections...');
+      for (const name of collectionNames) {
+        await ensurePrePostImagesEnabled(db, name);
+      }
+
       for (const name of collectionNames) {
         const collection = db.collection(name);
         const syncState = await syncCollection.findOne({ _id: name });
         const resumeAfter = syncState ? syncState.resumeToken : null;
         
         // 🔧 Change stream with options for better reliability
-        // ⚠️ fullDocumentBeforeChange requires MongoDB 6.0+ and collection must have:
-        //    db.runCommand({ collMod: "yourCollection", changeStreamPreAndPostImages: { enabled: true } })
         const changeStreamOptions = {
           ...(resumeAfter ? { resumeAfter } : {}),
           maxAwaitTimeMS: 60000, // Max time to wait for new changes
