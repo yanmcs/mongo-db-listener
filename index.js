@@ -14,7 +14,11 @@ const MAX_RETRY_DELAY = 5 * 60 * 1000; // 5 minutes in ms
 const RABBITMQ_HEARTBEAT = 60; // seconds
 const MONGO_HEARTBEAT_MS = 10000; // 10 seconds
 const MONGO_SERVER_SELECTION_TIMEOUT_MS = 30000; // 30 seconds
-const MONGO_SOCKET_TIMEOUT_MS = 60000; // 60 seconds
+// IMPORTANT for change streams:
+// - `socketTimeoutMS` should usually be 0 (no timeout), otherwise an idle period can close the stream.
+// - If you do set it, ensure it's comfortably larger than `maxAwaitTimeMS`.
+const MONGO_SOCKET_TIMEOUT_MS = parseInt(process.env.MONGO_SOCKET_TIMEOUT_MS || '0', 10);
+const MONGO_MAX_AWAIT_TIME_MS = parseInt(process.env.MONGO_MAX_AWAIT_TIME_MS || '60000', 10);
 
 // 🚦 Rate limiting & queue settings
 const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT || '10', 10);
@@ -39,6 +43,18 @@ let startPromise = null;
 let restartTimer = null;
 let isHealthy = false;
 let lastError = null;
+
+// ⚙️ Config sanity checks (helps avoid "closed unexpectedly" restart loops)
+if (Number.isFinite(MONGO_SOCKET_TIMEOUT_MS) && MONGO_SOCKET_TIMEOUT_MS > 0) {
+  // Leave some headroom for network jitter / event loop delay.
+  const recommendedMin = MONGO_MAX_AWAIT_TIME_MS + 5000;
+  if (MONGO_SOCKET_TIMEOUT_MS < recommendedMin) {
+    console.warn(
+      `⚠️ Config warning: MONGO_SOCKET_TIMEOUT_MS (${MONGO_SOCKET_TIMEOUT_MS}ms) is too low for change streams with ` +
+      `MONGO_MAX_AWAIT_TIME_MS (${MONGO_MAX_AWAIT_TIME_MS}ms). Consider setting socket timeout to 0, or >= ${recommendedMin}ms.`
+    );
+  }
+}
 
 // 🚦 Queue state
 let processingQueue = [];
@@ -581,7 +597,7 @@ async function start() {
         // 🔧 Change stream with options for better reliability
         const changeStreamOptions = {
           ...(resumeAfter ? { resumeAfter } : {}),
-          maxAwaitTimeMS: 60000, // Max time to wait for new changes
+          maxAwaitTimeMS: MONGO_MAX_AWAIT_TIME_MS, // Max time to wait for new changes
           fullDocument: 'updateLookup', // Get full document after change
           fullDocumentBeforeChange: 'whenAvailable', // Get full document before change (MongoDB 6.0+)
         };
@@ -628,6 +644,7 @@ async function start() {
         // 📢 Listen for stream close events
         changeStream.on('close', () => {
           if (!isStopping && !isRestarting) {
+            lastError = `Change Stream [${name}] closed unexpectedly`;
             console.warn(`⚠️ Change Stream for [${name}] closed unexpectedly`);
             scheduleRestart();
           }
