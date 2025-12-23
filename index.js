@@ -19,6 +19,7 @@ const MONGO_SERVER_SELECTION_TIMEOUT_MS = 30000; // 30 seconds
 // - If you do set it, ensure it's comfortably larger than `maxAwaitTimeMS`.
 const MONGO_SOCKET_TIMEOUT_MS = parseInt(process.env.MONGO_SOCKET_TIMEOUT_MS || '0', 10);
 const MONGO_MAX_AWAIT_TIME_MS = parseInt(process.env.MONGO_MAX_AWAIT_TIME_MS || '60000', 10);
+const RETRY_RESET_AFTER_MS = parseInt(process.env.RETRY_RESET_AFTER_MS || String(5 * 60 * 1000), 10); // default 5 minutes
 
 // 🚦 Rate limiting & queue settings
 const MAX_CONCURRENT_PROCESSING = parseInt(process.env.MAX_CONCURRENT || '10', 10);
@@ -43,6 +44,8 @@ let startPromise = null;
 let restartTimer = null;
 let isHealthy = false;
 let lastError = null;
+let retryResetTimer = null;
+let stableSince = null;
 
 // ⚙️ Config sanity checks (helps avoid "closed unexpectedly" restart loops)
 if (Number.isFinite(MONGO_SOCKET_TIMEOUT_MS) && MONGO_SOCKET_TIMEOUT_MS > 0) {
@@ -107,8 +110,8 @@ healthServer.listen(healthPort, () => {
   console.log(`🏥 Health check server listening on port ${healthPort}`);
 });
 
-function getRetryDelay() {
-  const delay = Math.min(Math.pow(2, retryCount) * 1000, MAX_RETRY_DELAY);
+function getRetryDelay(count = retryCount) {
+  const delay = Math.min(Math.pow(2, count) * 1000, MAX_RETRY_DELAY);
   return delay;
 }
 
@@ -205,7 +208,7 @@ async function connectRabbitMQ() {
       const connection = await amqp.connect(connectionUrl);
       
       connection.on('error', (err) => {
-        if (!isStopping) {
+        if (!isStopping && !isRestarting) {
           lastError = `RabbitMQ Connection: ${err.message}`;
           console.error('❌ RabbitMQ Connection Error:', err.message);
           scheduleRestart();
@@ -213,8 +216,9 @@ async function connectRabbitMQ() {
       });
       
       connection.on('close', () => {
-        if (!isStopping) {
-          console.warn('⚠️ RabbitMQ Connection Closed. Reconnecting...');
+        if (!isStopping && !isRestarting) {
+          lastError = 'RabbitMQ connection closed';
+          console.warn('⚠️ RabbitMQ Connection Closed.');
           scheduleRestart();
         }
       });
@@ -223,7 +227,7 @@ async function connectRabbitMQ() {
       const channel = await connection.createConfirmChannel();
       
       channel.on('error', (err) => {
-        if (!isStopping) {
+        if (!isStopping && !isRestarting) {
           lastError = `RabbitMQ Channel: ${err.message}`;
           console.error('❌ RabbitMQ Channel Error:', err.message);
           scheduleRestart();
@@ -231,7 +235,8 @@ async function connectRabbitMQ() {
       });
       
       channel.on('close', () => {
-        if (!isStopping) {
+        if (!isStopping && !isRestarting) {
+          lastError = 'RabbitMQ channel closed';
           console.warn('⚠️ RabbitMQ Channel Closed.');
           scheduleRestart();
         }
@@ -286,7 +291,7 @@ async function connectMongoDB() {
         const { newDescription } = event;
         const servers = Array.from(newDescription.servers.values());
         const allDown = servers.every(s => s.type === 'Unknown');
-        if (allDown && servers.length > 0 && !isStopping) {
+        if (allDown && servers.length > 0 && !isStopping && !isRestarting) {
           console.error('❌ All MongoDB servers are down');
           lastError = 'All MongoDB servers down';
           scheduleRestart();
@@ -294,7 +299,7 @@ async function connectMongoDB() {
       });
       
       mongoClient.on('error', (err) => {
-        if (!isStopping) {
+        if (!isStopping && !isRestarting) {
           lastError = `MongoDB: ${err.message}`;
           console.error('❌ MongoDB Client Error:', err.message);
           scheduleRestart();
@@ -302,7 +307,8 @@ async function connectMongoDB() {
       });
       
       mongoClient.on('close', () => {
-        if (!isStopping) {
+        if (!isStopping && !isRestarting) {
+          lastError = 'MongoDB connection closed';
           console.warn('⚠️ MongoDB Connection Closed.');
           scheduleRestart();
         }
@@ -340,6 +346,7 @@ async function withTimeout(fn, name, timeoutMs = CLEANUP_TIMEOUT_MS) {
 async function cleanup() {
   console.log('🧹 Cleaning up resources...');
   isHealthy = false;
+  stableSince = null;
 
   // ⏰ Clear interval timers first
   if (statusLogInterval) {
@@ -349,6 +356,10 @@ async function cleanup() {
   if (healthCheckInterval) {
     clearInterval(healthCheckInterval);
     healthCheckInterval = null;
+  }
+  if (retryResetTimer) {
+    clearTimeout(retryResetTimer);
+    retryResetTimer = null;
   }
 
   // Close change streams first (with timeout)
@@ -516,6 +527,7 @@ async function scheduleRestart() {
   
   isRestarting = true;
   isHealthy = false;
+  stableSince = null;
   
   // 🧹 Clean up existing connections before scheduling restart
   await cleanup();
@@ -529,8 +541,9 @@ async function scheduleRestart() {
   activeProcessing = 0;
   queuePaused = false;
   
-  const delay = getRetryDelay();
+  const delay = getRetryDelay(retryCount);
   console.log(`🔄 Restart scheduled in ${delay / 1000}s (Retry #${retryCount + 1})`);
+  retryCount++;
   
   if (restartTimer) {
     clearTimeout(restartTimer);
@@ -538,7 +551,6 @@ async function scheduleRestart() {
   
   restartTimer = setTimeout(async () => {
     restartTimer = null;
-    retryCount++;
     isRestarting = false;
     try {
       await start();
@@ -576,9 +588,8 @@ async function start() {
         return;
       }
 
-      // ✅ Successful connection: Reset retry count and set healthy
-      retryCount = 0;
-      isHealthy = true;
+      // Not healthy until all streams are initialized successfully
+      isHealthy = false;
 
       const db = mongoClient.db(dbName);
       const syncCollection = db.collection(syncCollectionName);
@@ -657,6 +668,24 @@ async function start() {
       
       console.log('✅ All change streams initialized successfully!');
       console.log(`📊 Status logging every ${STATUS_LOG_INTERVAL_MS / 1000}s, health check every ${HEALTH_CHECK_INTERVAL_MS / 1000}s`);
+
+      // ✅ Mark healthy and only reset retry counter after a stable period (prevents 1s restart storms)
+      isHealthy = true;
+      stableSince = Date.now();
+      const stableMark = stableSince;
+      if (retryResetTimer) clearTimeout(retryResetTimer);
+      retryResetTimer = setTimeout(() => {
+        if (
+          !isStopping &&
+          !isRestarting &&
+          isHealthy &&
+          stableSince === stableMark &&
+          retryCount !== 0
+        ) {
+          console.log(`✅ Stable for ${Math.round(RETRY_RESET_AFTER_MS / 1000)}s. Resetting retry counter.`);
+          retryCount = 0;
+        }
+      }, RETRY_RESET_AFTER_MS);
     } catch (err) {
       lastError = `Start: ${err.message}`;
       console.error('💥 Start sequence failed:', err.message);
