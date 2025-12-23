@@ -613,6 +613,14 @@ async function start() {
           fullDocumentBeforeChange: 'whenAvailable', // Get full document before change (MongoDB 6.0+)
         };
         
+        // 🕐 Track when this stream was created (to detect immediate closes)
+        const streamCreatedAt = Date.now();
+        const IMMEDIATE_CLOSE_THRESHOLD_MS = 5000; // 5 seconds
+        
+        if (resumeAfter) {
+          console.log(`🔑 Resume token for [${name}]: ${JSON.stringify(resumeAfter).substring(0, 80)}...`);
+        }
+        
         const changeStream = collection.watch([], changeStreamOptions);
         changeStreams.push(changeStream);
         
@@ -630,6 +638,7 @@ async function start() {
           if (!isStopping && !isRestarting) {
             lastError = `Change Stream [${name}]: ${error.message}`;
             console.error(`❌ Change Stream Error for [${name}]:`, error.message);
+            console.error(`❌ Error details: code=${error.code}, codeName=${error.codeName}`);
             
             // 🚨 Handle stale/expired resume tokens (oplog expires after 24h-7d)
             const isResumeTokenError = 
@@ -653,10 +662,25 @@ async function start() {
         });
         
         // 📢 Listen for stream close events
-        changeStream.on('close', () => {
+        changeStream.on('close', async () => {
           if (!isStopping && !isRestarting) {
-            lastError = `Change Stream [${name}] closed unexpectedly`;
-            console.warn(`⚠️ Change Stream for [${name}] closed unexpectedly`);
+            const aliveFor = Date.now() - streamCreatedAt;
+            const isImmediateClose = aliveFor < IMMEDIATE_CLOSE_THRESHOLD_MS;
+            
+            lastError = `Change Stream [${name}] closed unexpectedly after ${aliveFor}ms`;
+            console.warn(`⚠️ Change Stream for [${name}] closed unexpectedly after ${aliveFor}ms`);
+            
+            // 🚨 If stream closed immediately AND we were resuming, the token is likely stale
+            if (isImmediateClose && resumeAfter) {
+              console.warn(`⚠️ Stream [${name}] closed immediately with resume token — likely stale. Clearing token...`);
+              try {
+                await syncCollection.deleteOne({ _id: name });
+                console.log(`✅ Cleared resume token for [${name}]. Will restart from current position.`);
+              } catch (deleteErr) {
+                console.warn(`⚠️ Failed to clear resume token: ${deleteErr.message}`);
+              }
+            }
+            
             scheduleRestart();
           }
         });
