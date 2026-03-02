@@ -458,11 +458,13 @@ async function processQueueItem(item, channel, syncCollection) {
       });
     });
 
-    await syncCollection.updateOne(
-      { _id: name },
-      { $set: { resumeToken, updatedAt: new Date() } },
-      { upsert: true }
-    );
+    if (!isStopping && !isRestarting) {
+      await syncCollection.updateOne(
+        { _id: name },
+        { $set: { resumeToken, updatedAt: new Date() } },
+        { upsert: true }
+      );
+    }
     
     totalProcessed++;
   } catch (error) {
@@ -480,6 +482,7 @@ async function drainQueue(channel, syncCollection) {
     // Process without awaiting to allow concurrent processing
     processQueueItem(item, channel, syncCollection)
       .catch((error) => {
+        if (isStopping || isRestarting) return;
         lastError = `Process change [${item.name}]: ${error.message}`;
         console.error(`❌ Failed to process change for [${item.name}]:`, error.message);
         // 🚨 CRITICAL: If we can't send or sync, we must stop and retry from the last token
@@ -615,7 +618,7 @@ async function start() {
         
         // 🕐 Track when this stream was created (to detect immediate closes)
         const streamCreatedAt = Date.now();
-        const IMMEDIATE_CLOSE_THRESHOLD_MS = 5000; // 5 seconds
+        const IMMEDIATE_CLOSE_THRESHOLD_MS = 15000; // 15 seconds
         
         if (resumeAfter) {
           console.log(`🔑 Resume token for [${name}]: ${JSON.stringify(resumeAfter).substring(0, 80)}...`);
@@ -626,9 +629,36 @@ async function start() {
         
         console.log(`👀 Watching ${dbName}.${name} (Resuming: ${resumeAfter ? 'Yes' : 'No'})...`);
 
-        changeStream.on('change', (change) => {
+        changeStream.on('change', async (change) => {
           if (isStopping || isRestarting) return;
           const resumeToken = change._id;
+          
+          if (change.operationType === 'invalidate') {
+            console.warn(`⚠️ Received 'invalidate' event for [${name}]. Clearing resume token...`);
+            try {
+              await syncCollection.deleteOne({ _id: name });
+            } catch (err) {
+              console.warn(`⚠️ Failed to clear resume token after invalidate: ${err.message}`);
+            }
+            return;
+          }
+          
+          // 🛑 Filter out non-meaningful updates
+          if (change.operationType === 'update' && change.updateDescription) {
+            const updatedFields = Object.keys(change.updateDescription.updatedFields || {});
+            const removedFields = change.updateDescription.removedFields || [];
+            
+            const ignoredPrefixes = ['updatedAt', 'talkTime', 'control'];
+            const hasMeaningfulUpdates = updatedFields.some(field => 
+              !ignoredPrefixes.some(prefix => field === prefix || field.startsWith(`${prefix}.`))
+            ) || removedFields.length > 0;
+
+            if (!hasMeaningfulUpdates) {
+              // We could update the resume token here to avoid falling behind on restart, 
+              // but ignoring it completely is safer and usually fine.
+              return;
+            }
+          }
           
           // 🚦 Enqueue the change for rate-limited processing
           enqueueChange(name, change, resumeToken, channel, syncCollection);
