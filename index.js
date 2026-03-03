@@ -648,7 +648,7 @@ async function start() {
             const updatedFields = Object.keys(change.updateDescription.updatedFields || {});
             const removedFields = change.updateDescription.removedFields || [];
             
-            const ignoredPrefixes = ['updatedAt', 'talkTime', 'control', 'lastActive'];
+            const ignoredPrefixes = ['updatedAt', 'talkTime', 'control', 'lastActive', 'answers'];
             const hasMeaningfulUpdates = updatedFields.some(field => 
               !ignoredPrefixes.some(prefix => field === prefix || field.startsWith(`${prefix}.`))
             ) || removedFields.length > 0;
